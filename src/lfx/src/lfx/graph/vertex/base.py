@@ -653,6 +653,9 @@ class Vertex:
             self._update_built_object_and_artifacts(result)
         except Exception as exc:
             tb = traceback.format_exc()
+            import sys
+            print(f">>> FRAMEWORK ERROR building {self.display_name}: {exc}", file=sys.stderr, flush=True)
+            print(f">>> TRACEBACK:\n{tb}", file=sys.stderr, flush=True)
             await logger.aexception(exc)
             # Log transaction error
             flow_id = self.graph.flow_id

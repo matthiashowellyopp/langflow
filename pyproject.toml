@@ -149,6 +149,22 @@ override-dependencies = [
     # z3-solver 4.15.7 dropped Linux wheels, pin until codeflash is removed
     "z3-solver<4.15.7",
 ]
+# valkey-glide requires protobuf>=6 which conflicts with google-generativeai's
+# protobuf<6 constraint. These extras cannot be installed together.
+conflicts = [
+    [
+        { package = "langflow-base", extra = "valkey" },
+        { package = "langflow-base", extra = "google" },
+    ],
+    [
+        { package = "langflow-base", extra = "valkey" },
+        { package = "langflow-base", extra = "complete" },
+    ],
+    [
+        { package = "langflow-base", extra = "valkey" },
+        { package = "langflow-base", extra = "all" },
+    ],
+]
 
 [project.scripts]
 langflow = "langflow.langflow_launcher:main"

@@ -1777,7 +1777,7 @@
                   },
                   {
                     "name": "boto3",
-                    "version": "1.40.61"
+                    "version": "1.42.80"
                   },
                   {
                     "name": "googleapiclient",

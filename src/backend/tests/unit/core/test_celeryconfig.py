@@ -47,14 +47,14 @@ class TestCeleryConfigVariables:
     def test_broker_url_format(self):
         """Test that broker_url follows expected format."""
         broker_url = celeryconfig.broker_url
-        # Should be either Redis or RabbitMQ format
-        assert broker_url.startswith(("redis://", "amqp://")), f"Unexpected broker_url format: {broker_url}"
+        # Should be either Valkey, Redis or RabbitMQ format
+        assert broker_url.startswith(("valkey://", "redis://", "amqp://")), f"Unexpected broker_url format: {broker_url}"
 
     def test_result_backend_format(self):
         """Test that result_backend follows expected format."""
         result_backend = celeryconfig.result_backend
-        # Should be Redis format
-        assert result_backend.startswith("redis://"), f"Unexpected result_backend format: {result_backend}"
+        # Should be Valkey or Redis format
+        assert result_backend.startswith(("valkey://", "redis://")), f"Unexpected result_backend format: {result_backend}"
 
     def test_broker_url_not_empty(self):
         """Test that broker_url is not an empty string."""
@@ -93,3 +93,57 @@ class TestCeleryConfigStructure:
         if "://" in result_backend:
             host_part = result_backend.split("://")[1]
             assert len(host_part) > 0
+
+
+class TestCeleryConfigValkey:
+    """Unit tests for Valkey broker configuration."""
+
+    def test_valkey_env_vars_set_broker_and_backend(self, monkeypatch):
+        """Test that Valkey env vars produce valkey:// URLs."""
+        monkeypatch.setenv("LANGFLOW_VALKEY_HOST", "valkey-host")
+        monkeypatch.setenv("LANGFLOW_VALKEY_PORT", "6380")
+        monkeypatch.delenv("LANGFLOW_REDIS_HOST", raising=False)
+        monkeypatch.delenv("LANGFLOW_REDIS_PORT", raising=False)
+        import importlib
+
+        importlib.reload(celeryconfig)
+        assert celeryconfig.broker_url == "valkey://valkey-host:6380/0"
+        assert celeryconfig.result_backend == "valkey://valkey-host:6380/0"
+
+    def test_valkey_takes_precedence_over_redis(self, monkeypatch):
+        """Test that Valkey takes precedence when both are set."""
+        monkeypatch.setenv("LANGFLOW_VALKEY_HOST", "valkey-host")
+        monkeypatch.setenv("LANGFLOW_VALKEY_PORT", "6380")
+        monkeypatch.setenv("LANGFLOW_REDIS_HOST", "redis-host")
+        monkeypatch.setenv("LANGFLOW_REDIS_PORT", "6379")
+        import importlib
+
+        importlib.reload(celeryconfig)
+        assert celeryconfig.broker_url.startswith("valkey://")
+        assert celeryconfig.result_backend.startswith("valkey://")
+
+    def test_no_valkey_env_preserves_redis_behavior(self, monkeypatch):
+        """Test that without Valkey env vars, Redis behavior is preserved."""
+        monkeypatch.delenv("LANGFLOW_VALKEY_HOST", raising=False)
+        monkeypatch.delenv("LANGFLOW_VALKEY_PORT", raising=False)
+        monkeypatch.setenv("LANGFLOW_REDIS_HOST", "redis-host")
+        monkeypatch.setenv("LANGFLOW_REDIS_PORT", "6379")
+        import importlib
+
+        importlib.reload(celeryconfig)
+        assert celeryconfig.broker_url == "redis://redis-host:6379/0"
+        assert celeryconfig.result_backend == "redis://redis-host:6379/0"
+
+    def test_no_valkey_no_redis_falls_back_to_rabbitmq(self, monkeypatch):
+        """Test that without Valkey or Redis, RabbitMQ fallback is used."""
+        monkeypatch.delenv("LANGFLOW_VALKEY_HOST", raising=False)
+        monkeypatch.delenv("LANGFLOW_VALKEY_PORT", raising=False)
+        monkeypatch.delenv("LANGFLOW_REDIS_HOST", raising=False)
+        monkeypatch.delenv("LANGFLOW_REDIS_PORT", raising=False)
+        monkeypatch.delenv("BROKER_URL", raising=False)
+        monkeypatch.delenv("RESULT_BACKEND", raising=False)
+        import importlib
+
+        importlib.reload(celeryconfig)
+        assert celeryconfig.broker_url.startswith("amqp://")
+        assert celeryconfig.result_backend.startswith("redis://")

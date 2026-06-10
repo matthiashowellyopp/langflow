@@ -31,10 +31,10 @@ from lfx.services.adapters.payload import AdapterPayloadMissingError, AdapterPay
 from langflow.services.adapters.deployment.watsonx_orchestrate.client import resolve_runtime_credentials
 from langflow.services.adapters.deployment.watsonx_orchestrate.constants import ErrorPrefix
 from langflow.services.adapters.deployment.watsonx_orchestrate.core.tools import extract_langflow_connections_binding
+from langflow.services.adapters.deployment.watsonx_orchestrate.payloads import validate_wxo_name
 from langflow.services.adapters.deployment.watsonx_orchestrate.utils import (
     raise_as_deployment_error,
     require_single_deployment_id,
-    validate_wxo_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,13 +61,21 @@ async def create_config(
     config: DeploymentConfig,
     user_id: IdLike,
     db: AsyncSession,
+    created_app_ids_journal: list[str] | None = None,
 ) -> str:
-    """Create/update a wxO draft key-value connection config plus runtime credentials."""
-    app_id = validate_wxo_name(config.name)
+    """Create/update a wxO draft key-value connection config plus runtime credentials.
+
+    When ``created_app_ids_journal`` is provided, ``app_id`` is appended
+    immediately after provider connection creation succeeds so rollback can
+    clean up partially completed creates.
+    """
+    app_id = validate_wxo_name(config.name, field_label="Connection app id")
     env_var_keys = list((config.environment_variables or {}).keys())
     logger.debug("create_config: app_id='%s', env_var_keys=%s", app_id, env_var_keys)
 
     await asyncio.to_thread(clients.connections.create, payload={"app_id": app_id})
+    if created_app_ids_journal is not None:
+        created_app_ids_journal.append(app_id)
 
     wxo_config = ConnectionConfiguration(
         app_id=app_id,
@@ -150,7 +158,7 @@ def resolve_create_app_id(
     if config is None or config.raw_payload is None:
         return f"{deployment_name}_app_id"
 
-    normalized_config_name = validate_wxo_name(config.raw_payload.name)
+    normalized_config_name = validate_wxo_name(config.raw_payload.name, field_label="Connection app id")
     return f"{deployment_name}_{normalized_config_name}_app_id"
 
 
@@ -220,6 +228,16 @@ def warn_if_expected_ids_missing(
         )
 
 
+def _should_include_connection(
+    connection: ListConfigsResponse,
+) -> bool:
+    """Return True if the connection is a key-value connection in draft mode, otherwise False."""
+    return (
+        connection.security_scheme == ConnectionSecurityScheme.KEY_VALUE
+        and connection.environment == ConnectionEnvironment.DRAFT
+    )
+
+
 def _build_tenant_scope_config_items(
     *,
     raw_connections: list[ListConfigsResponse] | None,
@@ -230,20 +248,15 @@ def _build_tenant_scope_config_items(
         if not isinstance(connection, ListConfigsResponse):
             msg = f"wxO list_configs returned an unexpected connection entry type: {type(connection).__name__}."
             raise InvalidContentError(message=msg)
-        config_id = connection.connection_id
-        config_name = connection.app_id
-        config_type = connection.security_scheme
-        if config_type != "key_value_creds":
+        if not _should_include_connection(connection):
             continue
-        raw_env = getattr(connection, "environment", None)
-        environment = raw_env if isinstance(raw_env, str) else None
         configs.append(
             build_config_list_item(
                 config_item_data_slot=config_item_data_slot,
-                connection_id=config_id,
-                app_id=config_name,
-                config_type=config_type,
-                environment=environment,
+                connection_id=connection.connection_id,
+                app_id=connection.app_id,
+                config_type=connection.security_scheme,
+                environment=connection.environment,
             )
         )
     return configs
@@ -265,7 +278,7 @@ def _collect_tool_connection_ids(
 
 def _build_deployment_scope_config_items(
     *,
-    detailed_connections: list[object],
+    detailed_connections: list[ListConfigsResponse],
     config_item_data_slot: PayloadSlot[WatsonxConfigItemProviderData],
 ) -> tuple[list[ConfigListItem], set[object]]:
     configs: list[ConfigListItem] = []
@@ -273,18 +286,16 @@ def _build_deployment_scope_config_items(
     for connection in detailed_connections:
         connection_id = connection.connection_id
         resolved_connection_ids.add(connection_id)
-        config_type = getattr(connection, "security_scheme", None)
-        if config_type != "key_value_creds":
+
+        if not _should_include_connection(connection):
             continue
-        raw_env = getattr(connection, "environment", None)
-        environment = raw_env if isinstance(raw_env, str) else None
         configs.append(
             build_config_list_item(
                 config_item_data_slot=config_item_data_slot,
                 connection_id=connection_id,
-                app_id=getattr(connection, "app_id", None),
-                config_type=config_type,
-                environment=environment,
+                app_id=connection.app_id,
+                config_type=connection.security_scheme,
+                environment=connection.environment,
             )
         )
     return configs, resolved_connection_ids

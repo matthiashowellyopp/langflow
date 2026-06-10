@@ -7,7 +7,6 @@ from uuid import uuid4
 
 import pytest
 from langflow.api.v1.schemas.deployments import (
-    DEPLOYMENT_DESCRIPTION_MAX_LENGTH,
     DeploymentConfigListResponse,
     DeploymentCreateRequest,
     DeploymentFlowVersionListItem,
@@ -201,13 +200,17 @@ class TestDeploymentUpdateRequest:
         with pytest.raises(ValidationError, match="At least one of"):
             DeploymentUpdateRequest()
 
-    def test_rejects_explicit_null_only_payload(self):
-        with pytest.raises(ValidationError, match="At least one of"):
-            DeploymentUpdateRequest(description=None)
+    def test_accepts_explicit_null_description(self):
+        payload = DeploymentUpdateRequest(description=None)
+        assert payload.description is None
+        assert "description" in payload.model_fields_set
 
-    def test_rejects_description_over_max_length(self):
-        with pytest.raises(ValidationError, match="at most"):
-            DeploymentUpdateRequest(description="x" * (DEPLOYMENT_DESCRIPTION_MAX_LENGTH + 1))
+    def test_accepts_long_description(self):
+        description = "x" * 501
+
+        payload = DeploymentUpdateRequest(description=description)
+
+        assert payload.description == description
 
 
 class TestDeploymentSpecPayloadCompatibility:
@@ -215,7 +218,6 @@ class TestDeploymentSpecPayloadCompatibility:
         with pytest.raises(ValidationError, match="provider_spec"):
             DeploymentCreateRequest(
                 provider_id=uuid4(),
-                name="deployment",
                 description="",
                 type="agent",
                 provider_spec={"region": "us-east-1", "size": "small"},
@@ -224,22 +226,23 @@ class TestDeploymentSpecPayloadCompatibility:
     def test_create_request_accepts_provider_data_payload(self):
         request = DeploymentCreateRequest(
             provider_id=uuid4(),
-            name="deployment",
             description="",
             type="agent",
-            provider_data={"operations": []},
+            provider_data={"display_name": "deployment", "operations": []},
         )
-        assert request.provider_data == {"operations": []}
+        assert request.provider_data == {"display_name": "deployment", "operations": []}
 
-    def test_create_request_rejects_description_over_max_length(self):
-        with pytest.raises(ValidationError, match="at most"):
-            DeploymentCreateRequest(
-                provider_id=uuid4(),
-                name="deployment",
-                description="x" * (DEPLOYMENT_DESCRIPTION_MAX_LENGTH + 1),
-                type="agent",
-                provider_data={"operations": []},
-            )
+    def test_create_request_accepts_long_description(self):
+        description = "x" * 501
+
+        request = DeploymentCreateRequest(
+            provider_id=uuid4(),
+            description=description,
+            type="agent",
+            provider_data={"display_name": "deployment", "operations": []},
+        )
+
+        assert request.description == description
 
 
 # ---------------------------------------------------------------------------
@@ -442,9 +445,9 @@ class TestDeploymentListItemFlowVersionIds:
             "id": uuid4(),
             "provider_id": uuid4(),
             "provider_key": DeploymentProviderKey.WATSONX_ORCHESTRATE,
-            "name": "dep",
             "type": "agent",
             "resource_key": "rk-1",
+            "provider_data": {"display_name": "dep"},
         }
         defaults.update(kwargs)
         return DeploymentListItem(**defaults)
@@ -463,3 +466,86 @@ class TestDeploymentListItemFlowVersionIds:
     def test_accepts_empty_list(self):
         item = self._make_item(flow_version_ids=[])
         assert item.flow_version_ids == []
+
+
+# ---------------------------------------------------------------------------
+# DeploymentConfigListResponse — pagination & empty configs
+# ---------------------------------------------------------------------------
+
+
+class TestDeploymentConfigListResponsePagination:
+    def test_rejects_page_less_than_one(self):
+        with pytest.raises(ValidationError):
+            DeploymentConfigListResponse(page=0, size=10, total=0)
+
+    def test_rejects_size_less_than_one(self):
+        with pytest.raises(ValidationError):
+            DeploymentConfigListResponse(page=1, size=0, total=0)
+
+    def test_rejects_negative_total(self):
+        with pytest.raises(ValidationError):
+            DeploymentConfigListResponse(page=1, size=10, total=-1)
+
+
+# ---------------------------------------------------------------------------
+# ExecutionCreateRequest — required fields, provider_data validation
+# ---------------------------------------------------------------------------
+
+
+class TestRunCreateRequest:
+    def test_rejects_extra_fields(self):
+        from langflow.api.v1.schemas.deployments import RunCreateRequest
+
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            RunCreateRequest(provider_data={"input": "x"}, unknown_field="y")
+
+
+# ---------------------------------------------------------------------------
+# ExecutionCreateResponse — all fields including nullable provider_data
+# ---------------------------------------------------------------------------
+
+
+class TestRunCreateResponse:
+    def test_required_deployment_id(self):
+        from langflow.api.v1.schemas.deployments import RunCreateResponse
+
+        with pytest.raises(ValidationError, match="deployment_id"):
+            RunCreateResponse()
+
+
+# ---------------------------------------------------------------------------
+# SnapshotUpdateRequest — required fields
+# ---------------------------------------------------------------------------
+
+
+class TestSnapshotUpdateRequest:
+    def test_requires_flow_version_id(self):
+        from langflow.api.v1.schemas.deployments import SnapshotUpdateRequest
+
+        with pytest.raises(ValidationError, match="flow_version_id"):
+            SnapshotUpdateRequest()
+
+    def test_rejects_extra_fields(self):
+        from langflow.api.v1.schemas.deployments import SnapshotUpdateRequest
+
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            SnapshotUpdateRequest(flow_version_id=uuid4(), extra_field="bad")
+
+
+# ---------------------------------------------------------------------------
+# SnapshotUpdateResponse — response fields
+# ---------------------------------------------------------------------------
+
+
+class TestSnapshotUpdateResponse:
+    def test_requires_flow_version_id(self):
+        from langflow.api.v1.schemas.deployments import SnapshotUpdateResponse
+
+        with pytest.raises(ValidationError, match="flow_version_id"):
+            SnapshotUpdateResponse(provider_snapshot_id="snap-1")
+
+    def test_requires_provider_snapshot_id(self):
+        from langflow.api.v1.schemas.deployments import SnapshotUpdateResponse
+
+        with pytest.raises(ValidationError, match="provider_snapshot_id"):
+            SnapshotUpdateResponse(flow_version_id=uuid4())

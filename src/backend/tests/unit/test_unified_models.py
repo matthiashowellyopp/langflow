@@ -1,15 +1,39 @@
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from lfx.base.models import models_dev_catalog
 from lfx.base.models.unified_models import (
     _get_all_provider_mapped_fields,
     apply_provider_variable_config_to_build_config,
+    get_embedding_model_options,
     get_embeddings,
     get_unified_models_detailed,
     handle_model_input_update,
     update_model_options_in_build_config,
 )
 from lfx.base.models.unified_models.build_config import _resolve_dropdown_provider_values
+from lfx.base.models.unified_models.provider_queries import get_models_detailed
+
+
+@pytest.fixture(autouse=True)
+def _clear_models_dev_snapshot():
+    """Isolate every test in this file from any active models.dev snapshot.
+
+    The backend ``client`` fixture's lifespan installs a snapshot via
+    ``set_active_snapshot`` and never resets it on teardown, so tests that
+    expect the static bundled catalog (e.g. ``test_filter_by_model_name``,
+    which relies on ``gpt-4`` not being auto-deprecated by the age-based
+    rule in ``_translate_model_entry``) would otherwise fail when run in
+    the same xdist worker as a fixture-using test.
+    """
+    prior = models_dev_catalog.get_active_snapshot()
+    try:
+        models_dev_catalog.set_active_snapshot(None)
+        get_models_detailed.cache_clear()
+        yield
+    finally:
+        models_dev_catalog.set_active_snapshot(prior)
+        get_models_detailed.cache_clear()
 
 
 def _flatten_models(result):
@@ -87,6 +111,22 @@ def test_filter_by_model_type_embeddings():
     assert models, "Expected at least one embedding model"
     for model in models:
         assert model["metadata"].get("model_type", "llm") == "embeddings"
+
+
+@patch("lfx.base.models.unified_models.model_catalog._fetch_enabled_providers_for_user", new_callable=AsyncMock)
+@patch("lfx.base.models.unified_models.model_catalog._get_model_status", new_callable=AsyncMock)
+def test_google_embedding_options_map_dimensions_to_output_dimensionality(mock_get_model_status, mock_fetch_providers):
+    mock_get_model_status.return_value = (set(), set())
+    mock_fetch_providers.return_value = {"Google Generative AI"}
+
+    options = get_embedding_model_options(user_id="test-user")
+
+    google_embedding = next(
+        option
+        for option in options
+        if option["provider"] == "Google Generative AI" and option["name"] == "models/gemini-embedding-001"
+    )
+    assert google_embedding["metadata"]["param_mapping"]["dimensions"] == "output_dimensionality"
 
 
 def test_update_model_options_with_custom_field_name():
@@ -419,10 +459,14 @@ def test_get_embeddings_missing_model_name_raises(mock_get_api_key):
 
 @patch("lfx.base.models.unified_models.get_api_key_for_provider")
 def test_get_embeddings_missing_embedding_class_raises(mock_get_api_key):
+    """Unknown providers can't be looked up in EMBEDDING_PROVIDER_CLASS_MAPPING.
+
+    So missing ``embedding_class`` metadata still raises.
+    """
     mock_get_api_key.return_value = "test-key"
     model_dict = {
         "name": "text-embedding-3-small",
-        "provider": "OpenAI",
+        "provider": "Unknown",
         "metadata": {"param_mapping": {"model": "model"}},
     }
     with pytest.raises(ValueError, match="No embedding class defined in metadata"):
@@ -431,14 +475,47 @@ def test_get_embeddings_missing_embedding_class_raises(mock_get_api_key):
 
 @patch("lfx.base.models.unified_models.get_api_key_for_provider")
 def test_get_embeddings_empty_param_mapping_raises(mock_get_api_key):
+    """Unknown providers can't be looked up in EMBEDDING_PARAM_MAPPINGS.
+
+    So empty ``param_mapping`` metadata still raises.
+    """
     mock_get_api_key.return_value = "test-key"
     model_dict = {
         "name": "text-embedding-3-small",
-        "provider": "OpenAI",
+        "provider": "Unknown",
         "metadata": {"embedding_class": "OpenAIEmbeddings", "param_mapping": {}},
     }
     with pytest.raises(ValueError, match="Parameter mapping not found in metadata"):
         get_embeddings([model_dict])
+
+
+@patch("lfx.base.models.unified_models.get_api_key_for_provider")
+@patch("lfx.base.models.unified_models.get_embedding_class")
+def test_get_embeddings_falls_back_when_metadata_stripped(mock_get_class, mock_get_api_key):
+    """Selections persisted via the generic ``/models`` catalog lack enriched metadata.
+
+    ``embedding_class`` and ``param_mapping`` are missing in that case.
+    Instantiation should derive both from ``EMBEDDING_PROVIDER_CLASS_MAPPING``
+    and ``EMBEDDING_PARAM_MAPPINGS`` rather than failing — otherwise KB
+    ingestion would error on every model picked through the KB upload modal.
+    """
+    mock_get_api_key.return_value = "sk-test"
+    fake_class = MagicMock(return_value="embeddings-instance")
+    mock_get_class.return_value = fake_class
+
+    model_dict = {
+        "name": "text-embedding-3-small",
+        "provider": "OpenAI",
+        "metadata": {},  # No embedding_class, no param_mapping.
+    }
+    result = get_embeddings([model_dict])
+
+    mock_get_class.assert_called_once_with("OpenAIEmbeddings")
+    fake_class.assert_called_once()
+    kwargs = fake_class.call_args.kwargs
+    assert kwargs["model"] == "text-embedding-3-small"
+    assert kwargs["api_key"] == "sk-test"
+    assert result == "embeddings-instance"
 
 
 @patch("lfx.base.models.unified_models.get_api_key_for_provider")
@@ -457,6 +534,62 @@ def test_get_embeddings_openai_basic(mock_get_class, mock_get_api_key):
     kwargs = mock_embedding_class.call_args.kwargs
     assert kwargs["model"] == "text-embedding-3-small"
     assert kwargs["api_key"] == "sk-test"  # pragma: allowlist secret
+
+
+@pytest.mark.parametrize(
+    ("env_values", "expected_base_url"),
+    [
+        ({"OPENAI_EMBEDDINGS_API_BASE": "http://embeddings.example/v1"}, "http://embeddings.example/v1"),
+        ({"OPENAI_API_BASE": "http://openai-compatible.example/v1"}, "http://openai-compatible.example/v1"),
+        (
+            {
+                "OPENAI_EMBEDDINGS_API_BASE": "http://embeddings.example/v1",
+                "OPENAI_API_BASE": "http://openai-compatible.example/v1",
+            },
+            "http://embeddings.example/v1",
+        ),
+    ],
+)
+@patch("lfx.base.models.unified_models.get_api_key_for_provider")
+@patch("lfx.base.models.unified_models.get_embedding_class")
+def test_get_embeddings_openai_api_base_env_fallback(
+    mock_get_class,
+    mock_get_api_key,
+    monkeypatch,
+    env_values,
+    expected_base_url,
+):
+    mock_get_api_key.return_value = "sk-test"
+    mock_embedding_class = MagicMock()
+    mock_get_class.return_value = mock_embedding_class
+    monkeypatch.delenv("OPENAI_EMBEDDINGS_API_BASE", raising=False)
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+    for name, value in env_values.items():
+        monkeypatch.setenv(name, value)
+
+    get_embeddings([_make_openai_embedding_model()], api_key="sk-test")
+
+    kwargs = mock_embedding_class.call_args.kwargs
+    assert kwargs["base_url"] == expected_base_url
+
+
+@patch("lfx.base.models.unified_models.get_api_key_for_provider")
+@patch("lfx.base.models.unified_models.get_embedding_class")
+def test_get_embeddings_openai_explicit_api_base_overrides_env(mock_get_class, mock_get_api_key, monkeypatch):
+    mock_get_api_key.return_value = "sk-test"
+    mock_embedding_class = MagicMock()
+    mock_get_class.return_value = mock_embedding_class
+    monkeypatch.setenv("OPENAI_EMBEDDINGS_API_BASE", "http://embeddings.example/v1")
+    monkeypatch.setenv("OPENAI_API_BASE", "http://openai-compatible.example/v1")
+
+    get_embeddings(
+        [_make_openai_embedding_model()],
+        api_key="sk-test",  # pragma: allowlist secret
+        api_base="http://component.example/v1",
+    )
+
+    kwargs = mock_embedding_class.call_args.kwargs
+    assert kwargs["base_url"] == "http://component.example/v1"
 
 
 @patch("lfx.base.models.unified_models.get_api_key_for_provider")
@@ -484,7 +617,7 @@ def test_get_embeddings_optional_params_only_added_when_mapped(mock_get_class, m
 @patch("lfx.base.models.unified_models.get_api_key_for_provider")
 @patch("lfx.base.models.unified_models.get_embedding_class")
 def test_get_embeddings_google_timeout_wrapped_in_dict(mock_get_class, mock_get_api_key):
-    """For Google Generative AI, request_timeout should be wrapped as {'timeout': value}."""
+    """For Google Generative AI, request_timeout is wrapped and dimensions are passed through."""
     mock_get_api_key.return_value = "google-key"
     mock_embedding_class = MagicMock()
     mock_get_class.return_value = mock_embedding_class
@@ -497,14 +630,21 @@ def test_get_embeddings_google_timeout_wrapped_in_dict(mock_get_class, mock_get_
             "param_mapping": {
                 "model": "model",
                 "api_key": "google_api_key",  # pragma: allowlist secret
+                "dimensions": "output_dimensionality",
                 "request_timeout": "request_options",
             },
         },
     }
 
-    get_embeddings([google_model], api_key="google-key", request_timeout=30.0)  # pragma: allowlist secret
+    get_embeddings(
+        [google_model],
+        api_key="google-key",  # pragma: allowlist secret
+        dimensions=768,
+        request_timeout=30.0,
+    )
 
     kwargs = mock_embedding_class.call_args.kwargs
+    assert kwargs.get("output_dimensionality") == 768
     assert kwargs.get("request_options") == {"timeout": 30.0}
 
 
@@ -701,7 +841,7 @@ def test_get_embeddings_watsonx_error_wraps_message(mock_get_vars, mock_get_clas
 
 
 def test_handle_model_input_update_hides_all_provider_fields_by_default():
-    """Provider-specific fields should be hidden when no model is selected (except api_key which is always visible)."""
+    """Provider-specific fields should be hidden when no model is selected."""
     component = _make_mock_component()
     provider_fields = _get_all_provider_mapped_fields()
 
@@ -717,12 +857,75 @@ def test_handle_model_input_update_hides_all_provider_fields_by_default():
     )
 
     for f in provider_fields:
-        if f == "api_key":
-            # api_key is always forced visible at the end of handle_model_input_update
-            assert result[f]["show"] is True
-        else:
-            assert result[f]["show"] is False
+        assert result[f]["show"] is False, f"Field {f} should be hidden when no model is selected"
         assert result[f]["required"] is False
+
+
+def test_handle_model_input_update_ollama_hides_and_clears_api_key():
+    """Selecting Ollama (which has no api_key variable) must hide AND clear api_key.
+
+    Regression test: api_key was previously forced visible for every provider,
+    leaving a stale cross-provider credential (e.g. ``OPENAI_API_KEY``) sitting
+    behind the hidden field when switching to Ollama.
+    """
+    component = _make_mock_component()
+    selected_model = [{"name": "llama3", "provider": "Ollama", "metadata": {}}]
+    build_config = {
+        "model": _make_model_field(value=selected_model),
+        "api_key": {
+            "show": True,
+            "required": False,
+            "value": "OPENAI_API_KEY",
+            "load_from_db": True,
+            "_input_type": "SecretStrInput",
+        },
+        "ollama_base_url": {
+            "show": False,
+            "required": False,
+            "value": "",
+            "_input_type": "StrInput",
+        },
+    }
+
+    result = handle_model_input_update(
+        component,
+        build_config,
+        field_value=selected_model,
+        field_name="model",
+        get_options_func=lambda user_id=None: selected_model,  # noqa: ARG005
+    )
+
+    assert result["api_key"]["show"] is False, "api_key must be hidden for Ollama"
+    assert result["api_key"]["value"] == "", "stale cross-provider api_key must be cleared for Ollama"
+    assert result["api_key"]["load_from_db"] is False, "load_from_db must be reset when clearing api_key"
+    # Ollama's own variable is shown and configured.
+    assert result["ollama_base_url"]["show"] is True
+
+
+def test_handle_model_input_update_openai_keeps_api_key_visible():
+    """Providers that map a variable to api_key must keep it visible."""
+    component = _make_mock_component()
+    selected_model = [{"name": "gpt-4o", "provider": "OpenAI", "metadata": {}}]
+    build_config = {
+        "model": _make_model_field(value=selected_model),
+        "api_key": {
+            "show": False,  # start hidden to prove apply_provider_... re-shows it
+            "required": False,
+            "value": "",
+            "load_from_db": False,
+            "_input_type": "SecretStrInput",
+        },
+    }
+
+    result = handle_model_input_update(
+        component,
+        build_config,
+        field_value=selected_model,
+        field_name="model",
+        get_options_func=lambda user_id=None: selected_model,  # noqa: ARG005
+    )
+
+    assert result["api_key"]["show"] is True, "api_key must stay visible for OpenAI"
 
 
 def test_handle_model_input_update_uses_language_model_options_by_default():

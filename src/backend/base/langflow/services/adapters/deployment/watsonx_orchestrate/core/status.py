@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from ibm_watsonx_orchestrate_core.types.connections import ConnectionEnvironment
 from lfx.services.adapters.deployment.schema import DeploymentGetResult, DeploymentType, ItemResult
 
 
@@ -14,9 +13,9 @@ def get_deployment_metadata(
     provider_data: dict[str, Any] | None = None,
 ) -> ItemResult:
     result: dict[str, Any] = {
-        "id": data.get("id"),
+        "id": data["id"],
         "type": deployment_type.value,
-        "name": data.get("name"),
+        "name": data["name"],
         "created_at": data.get("created_on"),
         "updated_at": data.get("updated_at"),
     }
@@ -30,43 +29,34 @@ def get_deployment_detail_metadata(
     data: dict[str, Any],
     deployment_type: DeploymentType,
     provider_data: dict[str, Any] | None = None,
-    provider_raw: bool = False,  # noqa: FBT001,FBT002
 ) -> DeploymentGetResult:
     result: dict[str, Any] = {
-        "id": data.get("id"),
+        "id": data["id"],
         "type": deployment_type.value,
-        "name": data.get("name"),
-        "description": data.get("description"),
+        "name": data["name"],
+        "description": data["description"],
     }
     if provider_data:
         result["provider_data"] = provider_data
-    if provider_raw:
-        result["provider_data"] = data if not provider_data else {**provider_data, "provider_raw": data}
 
     return DeploymentGetResult(**result)
 
 
-def derive_agent_environment(agent: dict[str, Any]) -> str:
-    environments = agent.get("environments", [])
-    if not isinstance(environments, list) or not environments:
-        return "unknown"
+def get_agent_environments(agent: dict[str, Any]) -> list[str]:
+    """Return the de-duplicated list of environment names for an agent.
 
-    has_draft = False
-    has_live = False
-    for env in environments:
-        if not isinstance(env, dict):
+    Names are surfaced as-is from the provider so the API response stays
+    resilient if watsonx Orchestrate adds new environments in the future.
+    Missing keys or unexpected types indicate a contract break on watsonx
+    Orchestrate's side and are allowed to raise.
+    """
+    raw_environments = agent["environments"]
+    seen: set[str] = set()
+    names: list[str] = []
+    for env in raw_environments:
+        env_name = env["name"]
+        if env_name in seen:
             continue
-        env_name = str(env.get("name", "")).strip().lower()
-        if env_name == ConnectionEnvironment.DRAFT.value:
-            has_draft = True
-            continue
-        if env_name:
-            has_live = True
-
-    if has_draft and has_live:
-        return "both"
-    if has_live:
-        return "live"
-    if has_draft:
-        return "draft"
-    return "unknown"
+        seen.add(env_name)
+        names.append(env_name)
+    return names
